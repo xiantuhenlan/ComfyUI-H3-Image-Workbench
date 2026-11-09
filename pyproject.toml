@@ -1,0 +1,16 @@
+[project]
+name = "comfyui-h3-image-workbench"
+version = "0.1.0"
+description = "Independent p-h3-image workbench with per-shot prompts, reference images, optional prompt optimization, asset library and hardware monitoring."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["psutil"]
+
+[project.urls]
+Repository = "https://github.com/xiantuhenlan/ComfyUI-H3-Image-Workbench"
+"Bug Tracker" = "https://github.com/xiantuhenlan/ComfyUI-H3-Image-Workbench/issues"
+
+[tool.comfy]
+PublisherId = "xiantuhenlan"
+DisplayName = "ComfyUI-H3-Image-Workbench"

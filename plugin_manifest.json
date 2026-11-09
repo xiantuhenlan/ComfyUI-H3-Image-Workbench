@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "pluginId": "comfyui-h3-image-workbench",
+  "displayName": "ComfyUI-H3-Image-Workbench（闲兔H3生图工作台）",
+  "version": "0.1.0",
+  "channel": "development"
+}
