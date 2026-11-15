@@ -21,7 +21,7 @@ _IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '
 _VIDEO_EDITOR_SUBFOLDER = 'h3_image_workbench'
 _ASSET_METADATA = 'metadata.json'
 _ASSET_LOCK = 'metadata.lock'
-_ASSET_CATEGORIES = {'character': '角色资产', 'scene': '场景资产', 'prop': '道具资产', 'other': '其他资产', 'camera': '运镜资产', 'blocking': '站位资产'}
+_ASSET_CATEGORIES = {'character': '角色资产', 'scene': '场景资产', 'prop': '道具资产', 'other': '其他资产', 'camera': '运镜资产', 'blocking': '站位资产', 'audio': '音频资产'}
 _REPARSE_POINT = 0x400
 _MAX_COMMON_ASSET_BYTES = 128 * 1024 * 1024
 
@@ -70,8 +70,8 @@ def _asset_category_directory(root: Path, category: str) -> str:
 
 
 def _asset_root() -> Path:
-    # Own library: never discover or reuse the legacy shared asset directory.
-    configured = str(os.environ.get('COMFYUI_H3_IMAGE_ASSET_ROOT') or '').strip()
+    configured = (os.environ.get('XIANTU_ASSET_LIBRARY_ROOT', '').strip()
+                  or os.environ.get('COMFYUI_H3_IMAGE_ASSET_ROOT', '').strip())
     target = Path(configured).expanduser() if configured else Path(folder_paths.get_user_directory()) / 'comfyui-h3-image-workbench' / 'assets'
     target = target.resolve()
     try:
@@ -149,7 +149,7 @@ def _mime_type(path: Path):
 def _read_asset_index(root: Path):
     path = root / _ASSET_METADATA
     if not path.is_file():
-        return {"schemaVersion": 1, "assets": []}, True, "未找到 metadata.json，已根据六类文件夹重建"
+        return {"schemaVersion": 1, "assets": []}, True, "未找到 metadata.json，已根据资产文件夹重建"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict) or not isinstance(payload.get("assets"), list):

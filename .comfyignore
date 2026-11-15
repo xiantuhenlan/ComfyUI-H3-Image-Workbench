@@ -17,4 +17,4 @@ venv/
 dist/
 build/
 *.egg-info/
-plugin_manifest.json
+publish_action.example.yml

@@ -10,7 +10,7 @@
 - 前端样式和实例属性使用 h3iaw，序列化属性使用 h3ImageWorkbenchState；不读旧节点的状态属性。
 - 当前外部仅 clip、vae、prompt_upsampler 三个模型口及打开工作台按钮；图片、提示词和尺寸均在工作台内。project_name/workbench_state 为隐藏序列化字段。
 - 图片从当前任务 referenceImages 按顺序经 ComfyUI 核心 LoadImage 加载，按 image_1 到 image_9 交给 PH3ImageConditioning。提示词取当前任务 prompt，尺寸按左侧所选 width/height，不擅自改成 0/0，不增加额外图片、负面编码或颜色处理。
-- 优化提示词导航旁有用户要求的开关，默认开启、按任务保存。开启时按参考工作流参数 1536/off/thinking=true/default_template=true/MTP=auto/system_prompt为空调用官方 Generate Text；关闭时原提示词直达条件节点，不使用旧优化结果。没有自动尺寸、折叠参数或 thinking 面板。
+- 优化提示词默认关闭，按任务保存。开启时使用当前模型对应的官方 Generate Text 流程；关闭时原提示词直达条件节点。
 - prompt_upsampler 使用 ComfyUI 核心惰性输入。关闭优化时不请求其上游加载节点，不改该节点 mode 或连线，不执行卸载；开启后重新请求。若该模型还被其他执行分支使用，其他分支仍可请求它，不能宣称全局禁用该模型。已驻留内存也不强制卸载。
 - 按用户要求，右侧模板分类、搜索与自由创作区不再显示，提示词导航和编辑框占满右侧可用高度。只改变新工作台侧栏布局，不影响资产库或其他插件。
 - 左侧资产库按钮在文生图、图生图两种模式都保持面板底部；图生图参考图列表单独滚动，不把资产库按钮挤走。
@@ -22,7 +22,7 @@
 
 services.py 中包含本插件自己的资产 CRUD、元数据锁、图片改名/删除、硬件监控和清理实现；不是对旧接口做代理。仅注册 `/xiantu/h3-image-workbench/` 前缀下的 11 项 HTTP 方法/路径组合。
 
-默认资产目录：ComfyUI 用户目录下的 `comfyui-h3-image-workbench/assets`。如需显式配置，仅使用本插件的 COMFYUI_H3_IMAGE_ASSET_ROOT，不读取旧的 XIANTU_ASSET_LIBRARY_ROOT、不向祖先目录查找闲兔资产库。
+由启动器启动时，使用 `XIANTU_ASSET_LIBRARY_ROOT` 指定的闲兔资产库，与启动器共享目录和元数据锁。独立运行时使用 `COMFYUI_H3_IMAGE_ASSET_ROOT` 或 ComfyUI 用户目录下的 `comfyui-h3-image-workbench/assets`。工作台只展示可用作参考图的图片，旧独立库保留在原处。
 
 资产应用和上传素材进入 `ComfyUI/input/h3_image_workbench`。不会自动搬走或修改原资产库内容。
 

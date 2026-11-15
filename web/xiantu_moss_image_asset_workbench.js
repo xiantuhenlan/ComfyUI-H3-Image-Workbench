@@ -1,15 +1,20 @@
-﻿import { app } from "../../scripts/app.js";
+import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { mountH3PromptControls, h3JobInputs } from "./h3_prompt_controls.js";
+import { buildH3ImagePrompt, H3_IMAGE_MODELS, H3_IMAGE_SAVE, H3_IMAGE_PROMPT,
+    H3_IMAGE_MAX_REFERENCES, H3_IMAGE_RESOLUTIONS, H3_IMAGE_EDIT_NODES, configureOfficialH3ImageEdit,
+    h3ImageReferencePath, h3ImageSize, isH3ImageHistory, modelOptions, setCanvasImageFilename } from "./h3_image_workflow.js";
+import { loadH3ImageOfficialPrompts } from "./h3_image_official_prompts.js";
 import { repairWorkbenchNode } from "./h3_node_layout.js";
-import { mountCharacterMultiviewButton, updateCharacterMultiviewMode } from "./h3_multiview_bridge.js";
+import { formatH3MultiviewCanvas, mountCharacterMultiviewButton, switchImageGenerationMode } from "./h3_multiview_bridge.js";
+import { mountLoraControls, normalizeLoraModes, serializeWithLoraModes } from "./h3_lora_controls.js";
+import { mountReferenceMentions } from "./h3_reference_mentions.js";
 const QWEN21_EDIT_GROUPS = [];
 const QWEN21_TEXT_GROUPS = [];
 const QWEN21_PRESETS = [];
 const QWEN21_COMMON_NEGATIVE = "";
 
 const NODE = "ComfyUIH3ImageWorkbench";
-const TITLE = "闲兔H3生图工作台";
 const NODE_TITLE = "闲兔H3生图工作台";
 const WORKBENCH_NODE_TYPES = new Set([
     "XiantuImageAssetWorkbench",
@@ -606,9 +611,10 @@ const qwen21TextPrompt = (image) => {
     }
 }
 
-const normalizeState = (raw, projectName) => {
+const normalizeState = (raw, projectName, profile = "MOSS") => {
     let state = {};
     try { state = JSON.parse(String(raw || "{}")); } catch {}
+    const h3Image = profile === "H3-IMAGE";
     const shots = Array.isArray(state.shots) && state.shots.length ? state.shots : [{ id: makeId(), title: "分镜 1" }];
     const normalizeImage = (image, index, legacy = {}) => {
         let lastOutput = image?.lastOutput && typeof image.lastOutput === "object" ? { ...image.lastOutput } : legacy.lastOutput && typeof legacy.lastOutput === "object" ? { ...legacy.lastOutput } : null;
@@ -630,6 +636,8 @@ const normalizeState = (raw, projectName) => {
         propPreset: String(image?.propPreset || "none"),
         lightPreset: String(image?.lightPreset || "softbox"),
         prompt: String(image?.prompt ?? legacy.prompt ?? ""),
+        promptDrafts: image?.promptDrafts && typeof image.promptDrafts === "object" ? image.promptDrafts : {},
+        loraModes: normalizeLoraModes(image?.loraModes),
         negative: String(image?.negative ?? legacy.negative ?? ""),
         generationMode: (image?.generationMode || legacy.generationMode) === "图生图" ? "图生图" : "文生图",
         generateText: structuredClone(image?.generateText || {}),
@@ -647,8 +655,16 @@ const normalizeState = (raw, projectName) => {
     };
     state = {
         version: 2,
-        projectName: String(projectName || state.projectName || "MOSS图片素材工程"),
-        modelProfile: "MOSS",
+        projectName: String(projectName || state.projectName || (h3Image ? "H3-IMAGE 生图工程" : "MOSS图片素材工程")),
+        modelProfile: profile,
+        saveFilename: typeof state.saveFilename === "string" ? state.saveFilename : "",
+        loraGlobalModes: normalizeLoraModes(state.loraGlobalModes),
+        ...(h3Image ? {
+            h3ImageModels: Object.fromEntries(Object.keys(H3_IMAGE_MODELS).map(key => [
+                key, typeof state.h3ImageModels?.[key] === "string" ? state.h3ImageModels[key] : H3_IMAGE_MODELS[key][2],
+            ])),
+            h3ImageMatchReference: state.h3ImageMatchReference !== false,
+        } : {}),
         kreaCategory: KREA_CATEGORIES.some((item) => item.id === state.kreaCategory) ? state.kreaCategory : "people",
         kreaPreset: KREA_CATEGORIES.flatMap((item) => item.items).some((item) => item.id === state.kreaPreset)
             ? state.kreaPreset
@@ -666,13 +682,17 @@ const normalizeState = (raw, projectName) => {
             title: String(state.generationProgress?.title || "等待生成"),
             percent: Math.max(0, Math.min(100, Number(state.generationProgress?.percent) || 0)),
             batchText: String(state.generationProgress?.batchText || ""),
+            detail: String(state.generationProgress?.detail || ""),
+            shotName: String(state.generationProgress?.shotName || ""),
+            indeterminate: Boolean(state.generationProgress?.indeterminate),
             imageStartedAt: Math.max(0, Number(state.generationProgress?.imageStartedAt) || 0),
             imageElapsedMs: Math.max(0, Number(state.generationProgress?.imageElapsedMs) || 0),
         },
         width: snap32(state.width),
         height: snap32(state.height),
-        aspect: RESOLUTION_RATIOS[state.aspect] ? state.aspect : aspectFor(state.width || 1024, state.height || 1024),
-        megapixels: Math.max(0.1, Math.min(4, Math.round((Number(state.megapixels) || ((Number(state.width) || 1024) * (Number(state.height) || 1024) / (1024 * 1024))) * 10) / 10)),
+        aspect: RESOLUTION_RATIOS[state.aspect] ? state.aspect : h3Image ? "1:1" : aspectFor(state.width || 1024, state.height || 1024),
+        megapixels: h3Image ? (H3_IMAGE_RESOLUTIONS.includes(Number(state.megapixels)) ? Number(state.megapixels) : 16) :
+            Math.max(0.1, Math.min(4, Math.round((Number(state.megapixels) || ((Number(state.width) || 1024) * (Number(state.height) || 1024) / (1024 * 1024))) * 10) / 10)),
         referenceResolution: snap32(state.referenceResolution),
         shots: shots.map((shot, index) => {
             const sourceImages = Array.isArray(shot.images) && shot.images.length ? shot.images : [null];
@@ -786,16 +806,26 @@ const applyModelGroupSwitch = (controllerNode, requestedProfile, recordHistory =
     return true;
 };
 
-function createWorkbench(node) {
+function createWorkbench(node, profile, switchPage) {
+    const h3Image = profile === "H3-IMAGE";
+    const officialH3ImageEdit = node.properties?.h3ImageOfficialEdit === true;
+    const h3ImageCanvas = node.properties?.h3ImageCanvas === true && !officialH3ImageEdit;
+    const usesCanvasLoras = (task) => h3Image
+        ? h3ImageCanvas || (officialH3ImageEdit && task.generationMode === "图生图")
+        : !h3ImageCanvas && !officialH3ImageEdit;
+    const referenceLimit = h3Image ? H3_IMAGE_MAX_REFERENCES : 9;
+    const pageResolution = h3Image ? h3ImageSize : resolutionFor;
     const projectWidget = node.widgets?.find((widget) => widget.name === "project_name");
     const modelWidget = node.widgets?.find((widget) => widget.name === "model_profile");
     const modeWidget = node.widgets?.find((widget) => widget.name === "generation_mode");
     const stateWidget = node.widgets?.find((widget) => widget.name === "workbench_state");
-    let state = normalizeState(stateWidget?.value || node.properties?.h3ImageWorkbenchState, projectWidget?.value);
-    state.modelProfile = "MOSS";
+    const state = h3Image
+        ? normalizeState(node.properties?.h3ImagePageState, undefined, profile)
+        : normalizeState(stateWidget?.value || node.properties?.h3ImageWorkbenchState, projectWidget?.value);
     // Mode is owned by the selected task, not forced to text-to-image.
     let running = false;
     let generationInterrupted = false;
+    let stopRequest = null;
     let libraryAssets = [];
     let libraryCategories = [{ id: "character", name: "角色资产" }, { id: "scene", name: "场景资产" }, { id: "prop", name: "道具资产" }, { id: "other", name: "其他资产" }, { id: "camera", name: "运镜资产" }, { id: "blocking", name: "站位资产" }];
     let libraryCategory = "all";
@@ -822,9 +852,16 @@ function createWorkbench(node) {
 
     const root = document.createElement("div");
     root.className = "h3iaw-overlay";
+    const pageTitle = h3Image ? "H3-IMAGE 生图工作台" : "P-H3 生图工作台";
     root.innerHTML = `
-      <section class="h3iaw-app" role="dialog" aria-label="${TITLE}">
-        <header class="h3iaw-header"><strong>${TITLE}</strong><select data-model-profile aria-label="当前模型"><option value="MOSS">MOSS 模型</option></select><div class="h3iaw-header-progress"><div><span data-progress-title>等待生成</span><span data-progress-count>0%</span></div><progress data-progress-bar max="100" value="0"></progress></div><span class="h3iaw-image-elapsed" data-image-elapsed>本图时长 --:--</span><div class="h3iaw-header-hardware" data-hardware hidden><span data-hw-cpu>CPU --</span><span data-hw-memory>内存 --</span><span data-hw-vram>显存 --</span><span data-hw-temp>温度 --</span></div><em data-status></em><button class="primary" data-generate>▶ 开始生成</button><button class="h3iaw-header-gear" data-settings-toggle title="生成设置" aria-label="生成设置">⚙</button><div class="h3iaw-resource-settings" data-resource-settings hidden><strong>批量生成设置</strong><label><input type="checkbox" data-cleanup-cache> 卸载缓存</label><label><input type="checkbox" data-cleanup-vram> 卸载显存</label><label><input type="checkbox" data-cleanup-models> 卸载模型</label><label>每 <input type="number" min="1" max="99" step="1" data-cleanup-every> 个分镜卸载一次</label><label><input type="checkbox" data-monitor-hardware> 监控硬件</label><small>计数在每次开始或停止批量任务时重置</small></div><button class="close" data-close>×</button></header>
+      <section class="h3iaw-app" role="dialog" aria-label="${pageTitle}">
+        <header class="h3iaw-header">
+          <strong>${pageTitle}</strong><select data-model-profile aria-label="当前模型"><option value="MOSS">P-H3 模型</option><option value="H3-IMAGE">H3-IMAGE 模型</option></select>
+          <div class="h3iaw-header-progress">
+            <div class="h3iaw-hardware-row"><div class="h3iaw-header-hardware" data-hardware hidden><span data-hw-cpu>CPU --%</span><span data-hw-memory>内存 --%</span><span data-hw-vram>显存 --%</span><span data-hw-temp>温度 --℃</span></div><span class="h3iaw-image-elapsed">生成耗时 <time data-image-elapsed>00:00</time></span></div>
+            <div class="h3iaw-progress-row"><b data-progress-title role="status">等待生成</b><div class="h3iaw-progress-detail"><span data-progress-detail></span><em data-status></em></div><span data-progress-count>图片 0/1</span></div>
+            <progress data-progress-bar max="100" value="0" aria-label="生成进度"></progress>
+          </div><button class="primary" data-generate>▶ 开始生成</button><button class="h3iaw-header-gear" data-settings-toggle title="生成设置" aria-label="生成设置">⚙</button><div class="h3iaw-resource-settings" data-resource-settings hidden><strong>批量生成设置</strong><label><input type="checkbox" data-cleanup-cache> 卸载缓存</label><label><input type="checkbox" data-cleanup-vram> 卸载显存</label><label><input type="checkbox" data-cleanup-models> 卸载模型</label><label>每 <input type="number" min="1" max="99" step="1" data-cleanup-every> 个分镜卸载一次</label><label><input type="checkbox" data-monitor-hardware> 监控硬件</label><small>计数在每次开始或停止批量任务时重置</small></div><button class="close" data-close>×</button></header>
         <main class="h3iaw-main">
           <aside class="h3iaw-panel h3iaw-resolution"><div class="h3iaw-panel-head"><b data-left-title>生成设置</b></div><div class="h3iaw-resolution-settings" data-resolution-settings><label><span>宽高比</span><select data-aspect><option value="1:1">1:1（方形）</option><option value="2:3">2:3（竖幅照片）</option><option value="3:2">3:2（照片）</option><option value="3:4">3:4（竖幅标准）</option><option value="4:3">4:3（标准）</option><option value="9:16">9:16（竖幅宽屏）</option><option value="16:9">16:9（宽屏）</option><option value="21:9">21:9（超宽屏）</option></select></label><label><span>分辨率</span><select data-megapixels></select></label><div><span>输出尺寸</span><output data-output-size></output></div><footer><button data-open-assets>▣ 资产库</button></footer></div><div class="h3iaw-reference-panel" data-reference-panel hidden><section class="h3iaw-qwen-reference-box" data-qwen-reference-box hidden><header><b>对应参考图</b><small data-qwen-reference-count>0 / 16</small></header><div data-qwen-role-slots></div></section><button class="h3iaw-reference-drop" data-reference-upload><span>＋</span><b>上传参考图片</b><small>点击或拖入图片</small></button><div data-reference-list></div><footer><button data-open-assets>▣ 资产库</button></footer><input type="file" accept="image/png,image/jpeg,image/webp" multiple hidden data-reference-files></div></aside>
           <section class="h3iaw-panel h3iaw-stage"><div class="h3iaw-shotbar"><div class="h3iaw-camera-control" data-camera-control><button data-camera-open>运镜管理台</button></div><nav class="h3iaw-generation-tabs"><button data-generation-choice="文生图">文生图</button><button data-generation-choice="图生图">图生图</button></nav></div><div class="h3iaw-storyboard-controls"><div class="h3iaw-shot-tabs" data-shot-tabs></div><div class="h3iaw-storyboard-actions"><label class="h3iaw-global-draw"><input type="checkbox" data-global-draw>全局</label><label class="h3iaw-shot-draw-count">抽卡次数<select data-shot-draw-count>${Array.from({ length: 10 }, (_, count) => `<option value="${count + 1}">${count + 1} 次</option>`).join("")}</select></label><button class="success" data-generate-current>生成当前分镜</button><button data-clear>清空</button><button class="primary" data-add>＋ 分镜</button><small data-image-status>等待生成</small></div></div><div class="h3iaw-storyboard-pager"><button class="h3iaw-page-arrow" data-board-prev aria-label="上一组分镜">‹</button><div class="h3iaw-storyboard-grid" data-storyboard-grid></div><button class="h3iaw-page-arrow" data-board-next aria-label="下一组分镜">›</button></div></section>
@@ -892,7 +929,7 @@ function createWorkbench(node) {
     };
     const renderImageDuration = () => {
         const elapsed = imageGenerationStartedAt ? Date.now() - imageGenerationStartedAt : imageGenerationElapsedMs;
-        q("[data-image-elapsed]").textContent = `本图时长 ${formatImageDuration(elapsed)}`;
+        q("[data-image-elapsed]").textContent = formatImageDuration(elapsed);
     };
     const runImageDurationClock = () => {
         clearTimeout(imageGenerationTimer);
@@ -921,37 +958,125 @@ function createWorkbench(node) {
         state.generationProgress.imageElapsedMs = imageGenerationElapsedMs;
         renderImageDuration();
     };
-    const setHeaderProgress = (title = "等待生成", percent = 0, batchText = "") => {
-        const value = Math.max(0, Math.min(100, Number(percent) || 0));
-        state.generationProgress = { title: String(title), percent: value, batchText: String(batchText || ""), imageStartedAt: imageGenerationStartedAt, imageElapsedMs: imageGenerationElapsedMs };
-        q("[data-progress-title]").textContent = batchText ? `${title} · ${batchText}` : title;
-        q("[data-progress-count]").textContent = `${Math.round(value)}%`;
-        q("[data-progress-bar]").value = value;
+    const renderHeaderProgress = () => {
+        const { title, percent, batchText, detail, shotName, indeterminate } = state.generationProgress;
+        const phase = q("[data-progress-title]");
+        phase.textContent = shotName ? `${shotName} · ${title}` : title;
+        phase.title = phase.textContent;
+        const message = q("[data-progress-detail]");
+        message.textContent = detail;
+        message.title = detail;
+        phase.classList.toggle("error", title === "生成失败");
+        q("[data-progress-count]").textContent = batchText || "图片 0/1";
+        const bar = q("[data-progress-bar]");
+        if (indeterminate) bar.removeAttribute("value");
+        else bar.value = percent;
         renderImageDuration();
     };
-    const onSamplingProgress = (event) => {
-        if (!generationBatch.total) return;
-        const raw = event?.detail || {};
-        const detail = raw.progress || raw;
-        const eventPrompt = String(detail.prompt_id ?? detail.promptId ?? raw.prompt_id ?? raw.promptId ?? "");
-        if (eventPrompt && generationBatch.promptId && eventPrompt !== generationBatch.promptId) return;
-        const value = Number(detail.value || 0), maximum = Math.max(1, Number(detail.max || 1));
-        const samplePercent = Math.max(0, Math.min(100, value / maximum * 100));
-        const overall = (generationBatch.index + samplePercent / 100) / generationBatch.total * 100;
-        setHeaderProgress("采样生成中", overall, `图片 ${generationBatch.index + 1}/${generationBatch.total}`);
+    const setHeaderProgress = (title, {
+        detail = "", completed = generationBatch.index, percent = null, shotName = generationBatch.shotName || "",
+    } = {}) => {
+        state.generationProgress = {
+            title, detail, shotName, indeterminate: percent === null, percent: percent === null ? 0 : Math.max(0, Math.min(100, percent)),
+            batchText: `图片 ${completed}/${generationBatch.total || 1}`,
+            imageStartedAt: imageGenerationStartedAt, imageElapsedMs: imageGenerationElapsedMs,
+        };
+        renderHeaderProgress();
     };
-    const onExecutionInterrupted = (event) => {
-        const raw = event?.detail || {};
-        const eventPrompt = String(raw.prompt_id ?? raw.promptId ?? raw.execution?.prompt_id ?? "");
-        if (eventPrompt && generationBatch.promptId && eventPrompt !== generationBatch.promptId) return;
-        generationInterrupted = true;
-        stopImageDuration();
-        generationBatch = { ...generationBatch, total: 0, promptId: "" };
-        setHeaderProgress("已停止", 0, "");
-        q("[data-status]").textContent = "生成已停止";
-        q("[data-image-status]").textContent = "生成已停止";
-        save();
+    const progressNode = (...values) => {
+        for (const value of values) {
+            if (value == null) continue;
+            const key = String(value);
+            if (generationBatch.nodes?.[key]) return key;
+            const alias = generationBatch.aliases?.get(key);
+            if (alias) return alias;
+        }
+        return null;
     };
+    const nodeProgressLabel = (key) => {
+        const item = generationBatch.nodes[key];
+        const type = item.class_type || "";
+        const title = item._meta?.title || type;
+        const inputs = item.inputs || {};
+        const file = ["unet_name", "ckpt_name", "clip_name", "clip_name1", "vae_name", "lora_name", "model_name", "image"]
+            .map(name => inputs[name]).find(value => typeof value === "string" && value);
+        if (/TextGenerate/.test(type)) return { phase: "优化提示词中", detail: title, unit: "词元" };
+        if (/Sampler.*Select/.test(type)) return { phase: "准备采样参数", detail: title };
+        if (/Sampler/.test(type)) return { phase: "采样中", detail: title, unit: "步数" };
+        if (/VAE.*Decode/i.test(type)) return { phase: "VAE 解码中", detail: title };
+        if (/SaveImage/i.test(type)) return { phase: "保存图片中", detail: inputs.filename_prefix || title };
+        if (/PreviewImage/i.test(type)) return { phase: "更新预览中", detail: title };
+        if (/LoadImage/.test(type)) return { phase: "读取参考图", detail: file || title };
+        if (/ResizeImage|ImageScale/.test(type)) return { phase: "调整参考图尺寸", detail: title };
+        if (/Loader|Load.*Model/i.test(type)) return { phase: "加载模型／编码器", detail: file || title };
+        if (/Conditioning|TextEncode/.test(type)) return { phase: "编码生成条件中", detail: title };
+        if (type === NODE) return { phase: "工作台准备生成条件", detail: "" };
+        return { phase: "执行节点中", detail: title };
+    };
+    const showNodeProgress = (key, value, max) => {
+        if (!key) return;
+        if (generationBatch.activeNode !== key) generationBatch.internalStage = null;
+        if (generationBatch.activeNode === key && value == null) return;
+        generationBatch.activeNode = key;
+        generationBatch.started = true;
+        const { phase, detail, unit } = generationBatch.internalStage || nodeProgressLabel(key);
+        const measured = Number.isFinite(value) && Number.isFinite(max) && max > 0;
+        const step = measured ? (unit === "词元" ? `已生成 ${value} 词元` : `${unit ? unit + " " : ""}${value} / ${max}`) : "";
+        setHeaderProgress(phase, { detail: [step, detail].filter(Boolean).join(" · "), percent: measured && unit !== "词元" ? value / max * 100 : null });
+    };
+    const wakeHistoryCheck = () => {
+        generationBatch.historyChanged = true;
+        generationBatch.wakeHistory?.();
+    };
+    const handleRunEvent = (name, raw) => {
+        const data = raw && typeof raw === "object" ? raw : {};
+        const progress = data.progress || data;
+        const promptId = String(data.prompt_id ?? data.promptId ?? progress.prompt_id ?? progress.promptId ?? "");
+        if (name === "execution_start") generationBatch.observedPrompt = promptId;
+        if (!running || generationInterrupted || !generationBatch.total) return;
+        if (!generationBatch.promptId) {
+            const buffer = generationBatch.early;
+            if (buffer && promptId && buffer.length < 120) buffer.push([name, raw]);
+            return;
+        }
+        if ((promptId || generationBatch.observedPrompt) !== generationBatch.promptId) return;
+        if (promptId) generationBatch.observedPrompt = promptId;
+        if (name === "execution_start") {
+            if (!generationBatch.started) setHeaderProgress("开始执行工作流");
+            generationBatch.started = true;
+        } else if (name === "executing") {
+            if (data.node === null) wakeHistoryCheck();
+            else showNodeProgress(progressNode(data.node ?? data.display_node ?? raw), null, null);
+        } else if (name === "progress") {
+            showNodeProgress(progressNode(progress.node, data.node, generationBatch.activeNode), Number(progress.value), Number(progress.max));
+        } else if (name === "progress_state") {
+            for (const [rawId, current] of Object.entries(data.nodes || {})) {
+                if (current.state !== "running" || (current.prompt_id != null && String(current.prompt_id) !== generationBatch.promptId)) continue;
+                const key = progressNode(rawId, current.node_id, current.real_node_id, current.display_node_id, current.parent_node_id);
+                if (!key) continue;
+                generationBatch.aliases.set(rawId, key);
+                if (current.node_id != null) generationBatch.aliases.set(String(current.node_id), key);
+                if (Number(current.max) > 1 || Number(current.value) > 0) showNodeProgress(key, Number(current.value), Number(current.max));
+                else showNodeProgress(key, null, null);
+            }
+        } else if (name === "xiantu_h3_image_progress") {
+            const key = progressNode(data.node);
+            if (!key || generationBatch.nodes[key].class_type !== NODE || !data.phase) return;
+            generationBatch.activeNode = key;
+            generationBatch.started = true;
+            generationBatch.internalStage = { phase: data.phase, detail: data.detail || "", unit: data.phase === "优化提示词中" ? "词元" : "" };
+            setHeaderProgress(data.phase, { detail: data.detail || "" });
+        } else if (name === "execution_interrupted") {
+            generationInterrupted = true;
+            wakeHistoryCheck();
+        } else if (name === "execution_success") {
+            generationBatch.started = true;
+            setHeaderProgress("读取生成结果");
+            wakeHistoryCheck();
+        }
+    };
+    const runEventListeners = ["execution_start", "executing", "progress", "progress_state", "xiantu_h3_image_progress", "execution_success", "execution_interrupted"]
+        .map(name => [name, event => handleRunEvent(name, event?.detail)]);
     const refreshHardware = async () => {
         if (!state.cleanupSettings.monitorHardware) return;
         try {
@@ -987,6 +1112,15 @@ function createWorkbench(node) {
     };
     const activeShot = () => state.shots.find((shot) => shot.id === state.activeShotId) || state.shots[0];
     const activeImage = (shot = activeShot()) => shot.images.find((image) => image.id === shot.activeImageId) || shot.images[0];
+    const hasWiredUpsampler = () => node.inputs?.some(input => input.name === "prompt_upsampler" && input.link != null);
+    const officialCanvasNode = key => node.graph?.getNodeById?.(Number(H3_IMAGE_EDIT_NODES[key]));
+    const setOfficialCanvasWidget = (key, name, value) => {
+        const canvasNode = officialCanvasNode(key);
+        const widget = canvasNode?.widgets?.find(item => item.name === name);
+        if (!widget || widget.value === value) return;
+        widget.value = value;
+        widget.callback?.(value, app.canvas, canvasNode);
+    };
     const newImageTask = (index) => ({ id: makeId(), title: `图片 ${String(index + 1).padStart(2, "0")}`, selected: true, mode: "text", style: "general", mossPreset: "general_free", qwenTextPreset: "text_to_image", qwenTextOption: "", qwenEditPreset: "free_edit", qwenEditOption: "", cameraPreset: "", framingPreset: "medium", propPreset: "none", lightPreset: "softbox", editPreset: "free_edit", prompt: "", negative: "", referenceImages: [], drawCount: 1, outputs: [], lastPromptId: "", lastOutput: null });
     const TEMPLATES = {
         general: { positive: "主体明确，构图完整，空间关系准确，细节清晰，光影自然，色彩协调，高质量画面", negative: "低清晰度，模糊，结构错误，比例失调，多余肢体，畸形手指，乱码，水印，边框" },
@@ -995,8 +1129,25 @@ function createWorkbench(node) {
         typography: { positive: "专业文字设计，文字内容准确可读，字形清晰，层级明确，版式平衡，留白合理，商业设计品质", negative: "错字，乱码，缺字，文字重叠，字形扭曲，排版拥挤，低清晰度，水印" },
     };
     const save = () => {
-        state.modelProfile = "MOSS";
         state.generationMode = activeImage().generationMode || "文生图";
+        node.properties ||= {};
+        if (h3Image) {
+            node.properties.h3ImagePageState = JSON.stringify(state);
+            if (h3ImageCanvas) {
+                const canvasState = node.widgets?.find(widget => widget.name === "h3_image_state");
+                if (canvasState) canvasState.value = node.properties.h3ImagePageState;
+            }
+            if (officialH3ImageEdit && activeImage().generationMode === "图生图") {
+                const task = activeImage();
+                setOfficialCanvasWidget("prompt", "value", task.prompt);
+                setOfficialCanvasWidget("enableOptimizer", "value", Boolean(task.generateText?.enabled));
+                if (task.referenceImages[0]) {
+                    setOfficialCanvasWidget("reference", "image", h3ImageReferencePath(task.referenceImages[0]));
+                }
+            }
+            node.graph?.setDirtyCanvas?.(true, true);
+            return;
+        }
         if (projectWidget) projectWidget.value = state.projectName;
         if (modelWidget) modelWidget.value = state.modelProfile;
         if (modeWidget) modeWidget.value = state.generationMode;
@@ -1033,11 +1184,23 @@ function createWorkbench(node) {
         if (cursor < prompt.length) fragment.appendChild(document.createTextNode(prompt.slice(cursor)));
         editor.replaceChildren(fragment);
     };
+    const saveFilename = document.createElement("label");
+    saveFilename.innerHTML = '<span>保存文件名</span><input type="text" data-save-filename maxlength="100" placeholder="H3生图">';
+    q("[data-resolution-settings] footer").before(saveFilename);
+    const filenameInput = q("[data-save-filename]");
+    filenameInput.oninput = () => { state.saveFilename = filenameInput.value; save(); };
+    const promptField = q("[data-prompt]");
+    const closeReferenceMentions = mountReferenceMentions(promptField, () => {
+        const task = activeImage();
+        return task.generationMode === "图生图" ? task.referenceImages : [];
+    }, fileUrl);
     let syncH3PromptControls = () => {};
     const syncFields = () => {
+        closeReferenceMentions();
         syncH3PromptControls();
         const image = activeImage();
-        q("[data-prompt]").value = image.prompt;
+        promptField.value = image.prompt;
+        filenameInput.value = state.saveFilename;
         q("[data-negative]").value = image.negative;
         q("[data-demo-prompt]").value = state.modelProfile === "MOSS"
             ? mossPresetDemo(image, state.width, state.height)
@@ -1048,19 +1211,20 @@ function createWorkbench(node) {
         const megapixels = q("[data-megapixels]");
         aspect.value = state.aspect;
         if (!megapixels.options.length) {
-            for (let index = 1; index <= 40; index += 1) {
+            const choices = h3Image ? H3_IMAGE_RESOLUTIONS : Array.from({length: 40}, (_, index) => (index + 1) / 10);
+            for (const choice of choices) {
                 const option = document.createElement("option");
-                option.value = (index / 10).toFixed(1);
+                option.value = choice.toFixed(1);
                 megapixels.appendChild(option);
             }
         }
         [...megapixels.options].forEach((option) => {
             const value = Number(option.value).toFixed(1);
-            const size = resolutionFor(value, state.aspect);
-            option.textContent = `${value} MP · ${size.width} × ${size.height}`;
+            const size = pageResolution(value, state.aspect);
+            option.textContent = h3Image ? `${Number(value)} MP` : `${value} MP · ${size.width} × ${size.height}`;
         });
         megapixels.value = Number(state.megapixels).toFixed(1);
-        const size = resolutionFor(state.megapixels, state.aspect);
+        const size = pageResolution(state.megapixels, state.aspect);
         state.width = size.width;
         state.height = size.height;
         q("[data-output-size]").textContent = `${size.width} × ${size.height}`;
@@ -1165,6 +1329,8 @@ function createWorkbench(node) {
         q(".h3iaw-resolution").classList.add("h3-internal-images");
         q(".h3iaw-resolution").classList.toggle("h3-image-mode", imageMode);
         q("[data-resolution-settings]").hidden = false;
+        saveFilename.hidden = imageMode;
+        promptField.placeholder = imageMode ? "描述编辑要求，输入 @ 选择参考图" : "描述主体、场景、构图、光线和风格";
         q("[data-reference-panel]").hidden = !imageMode;
         q("[data-qwen-reference-box]").hidden = true;
         q("[data-reference-upload]").hidden = imageMode && state.modelProfile === "Qwen Image 2.1";
@@ -1182,8 +1348,10 @@ function createWorkbench(node) {
         q("[data-prompt-rich]").hidden = !qwenEditMode;
         q("[data-prompt]").hidden = qwenEditMode;
         const demoTab = q('[data-prompt-tab="demo"]');
-        demoTab.hidden = qwenMode;
-        if (qwenMode && promptTab === "demo") promptTab = "positive";
+        demoTab.hidden = qwenMode || h3Image;
+        q('[data-prompt-tab="negative"]').hidden = h3Image;
+        if ((qwenMode || h3Image) && promptTab === "demo") promptTab = "positive";
+        refreshH3ImageControls();
         const image = activeImage();
         renderQwenControls();
         qa("[data-edit-preset]").forEach((button) => button.classList.toggle("active", button.dataset.editPreset === image.editPreset));
@@ -1313,6 +1481,7 @@ function createWorkbench(node) {
             const active = shot?.id === state.activeShotId ? "active" : "";
             return `<button type="button" class="h3iaw-storyboard-cell ${active} ${shot ? "" : "empty"}" ${shot ? `data-preview-shot="${esc(shot.id)}"` : "disabled"}><b>分镜 ${String(shotIndex + 1).padStart(2, "0")}</b>${url ? `<img src="${esc(url)}" alt="分镜 ${shotIndex + 1}"><span class="h3iaw-storyboard-zoom" data-preview-zoom="${esc(shot.id)}" role="button" title="放大查看">⛶</span>` : ""}</button>`;
         }).join("");
+        refreshH3ImageControls();
         q("[data-board-prev]").hidden = state.shots.length <= 10;
         q("[data-board-next]").hidden = state.shots.length <= 10;
         q("[data-board-prev]").disabled = storyboardPage === 0;
@@ -1398,6 +1567,13 @@ function createWorkbench(node) {
         showResult();
     };
     const outputImages = (history) => {
+        if (h3Image && !h3ImageCanvas) {
+            const saveNode = officialH3ImageEdit && history?.outputs?.[H3_IMAGE_EDIT_NODES.save]
+                ? H3_IMAGE_EDIT_NODES.save : H3_IMAGE_SAVE;
+            return (history?.outputs?.[saveNode]?.images || []).map(image => ({
+                name: image.filename, subfolder: image.subfolder || "", type: image.type || "output",
+            })).filter(image => image.name);
+        }
         const found = [];
         const visit = (value) => {
             if (!value) return;
@@ -1416,10 +1592,24 @@ function createWorkbench(node) {
     const queuedWorkbenchState = (record) => {
         const promptGraph = Array.isArray(record?.prompt) ? record.prompt[2] : (record?.prompt?.output || record?.prompt);
         const queuedNode = promptGraph?.[String(node.id)];
-        if (queuedNode?.class_type !== NODE) return null;
-        try { return JSON.parse(String(queuedNode.inputs?.workbench_state || "{}")); } catch { return null; }
+        if (queuedNode?.class_type !== NODE || Boolean(queuedNode.inputs?.h3_image_state) !== h3Image) return null;
+        try {
+            return JSON.parse(h3Image ? queuedNode.inputs.h3_image_state : queuedNode.inputs?.workbench_state || "{}");
+        } catch { return null; }
     };
-    const queuedHistoryTarget = (record) => {
+    const optimizedHistoryText = record => h3ImageCanvas
+        ? record.outputs?.[String(node.id)]?.h3_generated_text?.[0]
+        : (officialH3ImageEdit ? record.outputs?.[H3_IMAGE_EDIT_NODES.preview]?.text?.[0] : undefined)
+            ?? record.outputs?.[H3_IMAGE_PROMPT]?.text?.[0];
+    const queuedHistoryTarget = (record, promptId) => {
+        if (h3Image && !h3ImageCanvas) {
+            if (!promptId || !(isH3ImageHistory(record) || (officialH3ImageEdit && record.outputs?.[H3_IMAGE_EDIT_NODES.save]))) return null;
+            for (const shot of state.shots) {
+                const imageTask = shot.images.find(item => item.lastPromptId === String(promptId));
+                if (imageTask) return { imageTask };
+            }
+            return null;
+        }
         const queuedState = queuedWorkbenchState(record);
         if (!queuedState) return null;
         const queuedShot = (queuedState.shots || []).find((item) => item?.id === queuedState.activeShotId);
@@ -1428,10 +1618,11 @@ function createWorkbench(node) {
         return imageTask ? { queuedState, queuedShot, shot, imageTask } : null;
     };
     const ingestHistoryOutput = (record, promptId) => {
-        const target = queuedHistoryTarget(record);
+        const target = queuedHistoryTarget(record, promptId);
         const images = outputImages(record);
         if (!target || !images.length) return false;
         const { imageTask } = target;
+        if (h3Image) imageTask.h3GeneratedText = String(optimizedHistoryText(record) || "");
         const output = images.at(-1);
         const outputKey = fileRecordKey(output);
         if ((imageTask.deletedOutputs || []).includes(outputKey)) return false;
@@ -1461,7 +1652,7 @@ function createWorkbench(node) {
         let restored = false;
         for (const [promptId, record] of entries) {
             if (String(record?.status?.status_str || "") !== "success") continue;
-            const target = queuedHistoryTarget(record);
+            const target = queuedHistoryTarget(record, promptId);
             if (!target || String(target.imageTask.lastPromptId || "") !== String(promptId)) continue;
             if (ingestHistoryOutput(record, promptId)) restored = true;
         }
@@ -1486,13 +1677,13 @@ function createWorkbench(node) {
     const onExecutionSuccess = (event) => {
         const detail = event?.detail || {};
         const promptId = String(detail.prompt_id ?? detail.promptId ?? "");
-        if (promptId) syncPromptHistoryAfterExecution(promptId);
+        if (promptId && (!h3Image || h3ImageCanvas || state.shots.some(shot => shot.images.some(item => item.lastPromptId === promptId)))) syncPromptHistoryAfterExecution(promptId);
     };
     const uploadReferenceFile = async (file) => {
         const form = new FormData();
         form.append("image", file, file.name);
         form.append("type", "input");
-        form.append("subfolder", "h3_image_workbench");
+        form.append("subfolder", h3Image ? "h3_image_workbench/h3-image/references" : "h3_image_workbench");
         form.append("overwrite", "false");
         const response = await api.fetchApi("/upload/image", { method: "POST", body: form });
         const uploaded = await response.json().catch(() => ({}));
@@ -1512,9 +1703,9 @@ function createWorkbench(node) {
     const uploadReferenceFiles = async (files, requestedRole = pendingReferenceRole) => {
         const image = activeImage();
         const replacing = requestedRole && image.referenceImages.some((record) => record.slotKey === requestedRole);
-        const available = Math.max(0, 9 - image.referenceImages.length + (replacing ? 1 : 0));
+        const available = Math.max(0, referenceLimit - image.referenceImages.length + (replacing ? 1 : 0));
         const selectedFiles = [...files].filter((item) => item.type.startsWith("image/")).slice(0, available);
-        if (!selectedFiles.length && available === 0) throw new Error("H3 最多添加 9 张图片，请先删除不需要的图片。");
+        if (!selectedFiles.length && available === 0) throw new Error(`最多添加 ${referenceLimit} 张参考图，请先删除不需要的图片。`);
         const preset = state.modelProfile === "Qwen Image 2.1" && state.generationMode === "图生图" ? QWEN21_EDIT_PRESET_MAP.get(image.qwenEditPreset) : null;
         for (let index = 0; index < selectedFiles.length; index += 1) {
             const uploaded = await uploadReferenceFile(selectedFiles[index]);
@@ -1532,6 +1723,7 @@ function createWorkbench(node) {
         const list = q("[data-reference-list]");
         if (!list) return;
         const image = activeImage();
+        refreshH3ImageControls();
         const qwenPreset = state.modelProfile === "Qwen Image 2.1" && state.generationMode === "图生图" ? QWEN21_EDIT_PRESET_MAP.get(image.qwenEditPreset) : null;
         if (qwenPreset) {
             const slots = qwenPreset.slots || [];
@@ -1668,23 +1860,50 @@ function createWorkbench(node) {
     };
     const openCommonAssets = async () => { await loadLibraryAssets(); renderLibrary(); q("[data-library-dialog]").hidden = false; };
     const waitForPrompt = async (promptId) => {
+        const batch = generationBatch;
         const deadline = Date.now() + 12 * 60 * 60 * 1000;
         let successAt = 0;
         while (Date.now() < deadline) {
             if (generationInterrupted) throw new Error("生成已停止");
+            batch.historyChanged = false;
             const response = await api.fetchApi(`/history/${encodeURIComponent(promptId)}?t=${Date.now()}`);
             if (generationInterrupted) throw new Error("生成已停止");
             if (response.ok) {
                 const record = (await response.json())?.[promptId];
                 const status = String(record?.status?.status_str || "");
                 const images = outputImages(record);
-                if (status === "error") throw new Error("图片生成失败，请查看 ComfyUI 错误信息");
+                if (status === "error") {
+                    const error = record.status?.messages?.findLast(([type]) => type === "execution_error")?.[1];
+                    throw new Error(error?.exception_message || "图片生成失败，请查看 ComfyUI 错误信息");
+                }
                 if (status === "success") {
                     successAt ||= Date.now();
                     if (images.length || Date.now() - successAt > 15000) return record;
                 }
             }
-            await new Promise((resolve) => setTimeout(resolve, 1000));
+            if (!generationBatch.started && !generationInterrupted && generationBatch.promptId === String(promptId)) {
+                const queue = await api.fetchApi("/queue").then(response => response.ok ? response.json() : null).catch(() => null);
+                if (!generationBatch.started && !generationInterrupted && queue) {
+                    const runningTasks = queue.queue_running || [];
+                    const waiting = (queue.queue_pending || []).findIndex(([, id]) => String(id) === String(promptId));
+                    if (runningTasks.some(([, id]) => String(id) === String(promptId))) {
+                        generationBatch.started = true;
+                        setHeaderProgress("开始执行工作流");
+                    } else if (waiting >= 0) {
+                        setHeaderProgress("排队中", { detail: `前面 ${waiting + runningTasks.length} 个任务` });
+                    }
+                }
+            }
+            if (batch.historyChanged) continue;
+            await new Promise((resolve) => {
+                const wake = () => {
+                    clearTimeout(timer);
+                    batch.wakeHistory = null;
+                    resolve();
+                };
+                const timer = setTimeout(wake, 1000);
+                batch.wakeHistory = wake;
+            });
         }
         throw new Error("等待图片生成结果超时");
     };
@@ -1702,18 +1921,24 @@ function createWorkbench(node) {
         syncFields(); save();
     };
     q("[data-megapixels]").onchange = (event) => {
-        state.megapixels = Math.max(0.1, Math.min(4, Number(event.target.value) || 1));
+        state.megapixels = h3Image ? Number(event.target.value) : Math.max(0.1, Math.min(4, Number(event.target.value) || 1));
+        if (h3Image && activeImage().generationMode === "图生图") state.h3ImageMatchReference = false;
         syncFields(); save();
     };
-    qa("[data-generation-choice]").forEach((button) => button.onclick = async () => {
-        const image=activeImage(),previous=image.generationMode;
-        image.generationMode = button.dataset.generationChoice;
-        try{await updateCharacterMultiviewMode(image,state);}
-        catch(error){if(image.generationMode===button.dataset.generationChoice)image.generationMode=previous;await workbenchAlert(String(error.message||error),'模式切换失败');}
-        state.generationMode=activeImage().generationMode||'文生图';
-        renderMode(); syncFields(); applyNodeProtocol(node, state); save();
+    qa("[data-generation-choice]").forEach((button) => button.onclick = () => {
+        if (!switchImageGenerationMode(activeImage(), button.dataset.generationChoice)) return;
+        state.generationMode = activeImage().generationMode;
+        promptTab = "positive";
+        syncFields(); renderPromptTabs(); applyNodeProtocol(node, state); save();
     });
-    q("[data-model-profile]").onchange = (event) => { state.modelProfile = event.target.value; activeImage().style = "general"; activeImage().mossPreset = "general_free"; mossGroup = "general"; enforceCapabilities(); renderMode(); syncFields(); applyNodeProtocol(node, state); applyModelGroupSwitch(node, state.modelProfile, true); save(); };
+    q("[data-model-profile]").onchange = (event) => {
+        if (running) { event.target.value = profile; return; }
+        const requested = event.target.value;
+        if (requested !== profile) {
+            q("[data-close]").click();
+            switchPage(requested);
+        }
+    };
     q("[data-reference-upload]").onclick = () => { pendingReferenceRole = ""; q("[data-reference-files]").click(); };
     q("[data-reference-files]").onchange = async (event) => { try { await uploadReferenceFiles(event.target.files, pendingReferenceRole); } catch (error) { q("[data-status]").textContent = String(error?.message || error); } pendingReferenceRole = ""; event.target.value = ""; };
     const referenceDrop = q("[data-reference-upload]");
@@ -1736,15 +1961,15 @@ function createWorkbench(node) {
     q("[data-library-grid]").ondragover = (event) => event.preventDefault();
     q("[data-library-grid]").ondrop = async (event) => { event.preventDefault(); try { await addLibraryFiles(event.dataTransfer.files || []); } catch (error) { await workbenchAlert(String(error?.message || error), "导入失败"); } };
     q("[data-library-apply]").onclick = async () => {
-        const available = Math.max(0, 9 - activeImage().referenceImages.length);
+        const image = activeImage();
+        const available = Math.max(0, referenceLimit - image.referenceImages.length);
         const ids = libraryAssets.filter((asset) => asset.selected).slice(0, available).map((asset) => asset.id);
-        if (!available) { q("[data-status]").textContent = "H3 最多添加 9 张图片"; return; }
+        if (!available) { q("[data-status]").textContent = `最多添加 ${referenceLimit} 张参考图`; return; }
         if (!ids.length) return;
         try {
             const response = await api.fetchApi("/xiantu/h3-image-workbench/common-assets/apply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
             const payload = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(payload.error || "资产应用失败");
-            const image = activeImage();
             const preset = state.modelProfile === "Qwen Image 2.1" && state.generationMode === "图生图" ? QWEN21_EDIT_PRESET_MAP.get(image.qwenEditPreset) : null;
             for (const item of payload.assets || []) {
                 const record = { name: item.filename, subfolder: item.subfolder || "", type: item.type || "input" };
@@ -1971,6 +2196,7 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
     q("[data-apply-template]").onclick = () => applyTemplate(false);
     q("[data-reset-prompts]").onclick = () => {
         const image = activeImage();
+        if (h3Image) return workbenchAlert("图生图使用 <Picture 1> 指代第一张参考图，后续图片按上传顺序编号。提示词写清需要修改和保留的内容。开启优化后，会用官方工作流的提示词模板扩写。", "H3-IMAGE 提示词");
         if (state.modelProfile === "Qwen Image 2.1") return workbenchAlert(qwenOfficialGuide(), "Qwen Image 2.1 官方提示词参考");
         const title = state.modelProfile === "MOSS" ? `MOSS 官方提示词说明 · ${(MOSS_PRESET_BY_ID.get(image.mossPreset)?.label || mossTemplate(image)[0])}` : "MOSS 官方提示词说明";
         const prefix = state.modelProfile === "MOSS" ? "" : "当前选择的不是 MOSS 模型；以下内容仅对应 MOSS-Image。\n\n";
@@ -1989,8 +2215,175 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
     q("[data-cleanup-models]").onchange = (event) => { state.cleanupSettings.models = event.target.checked; save(); };
     q("[data-cleanup-every]").onchange = (event) => { state.cleanupSettings.every = Math.max(1, Math.min(99, Number(event.target.value) || 1)); event.target.value = String(state.cleanupSettings.every); save(); };
     q("[data-monitor-hardware]").onchange = (event) => { state.cleanupSettings.monitorHardware = event.target.checked; syncHardwareMonitor(); save(); };
+    let h3Controls = null;
+    let modelRefresh = null;
+    const referenceSizes = new Map();
+    const referenceOutputSize = ref => {
+        if (!ref) return Promise.resolve(null);
+        const url = fileUrl(ref);
+        if (!referenceSizes.has(url)) {
+            referenceSizes.set(url, new Promise(resolve => {
+                const image = new Image();
+                image.onload = () => {
+                    const { naturalWidth, naturalHeight } = image;
+                    const scale = Math.sqrt((4 * 1024 ** 2) / (naturalWidth * naturalHeight));
+                    // Same size calculation and 32-pixel crop as the official resize nodes.
+                    const rounded = [naturalWidth, naturalHeight].map(value => {
+                        const scaled = value * scale;
+                        const whole = Math.floor(scaled);
+                        return scaled - whole === 0.5 ? whole + whole % 2 : Math.round(scaled);
+                    });
+                    const aligned = rounded.map(value => Math.floor(value / 32) * 32);
+                    const [width, height] = aligned.every(Boolean) ? aligned : rounded;
+                    resolve({ width, height });
+                };
+                image.onerror = () => {
+                    referenceSizes.delete(url);
+                    resolve(null);
+                };
+                image.src = url;
+            }));
+        }
+        return referenceSizes.get(url);
+    };
+    const multiviewCanvasSize = async task => {
+        if (h3Image && task.generationMode === "图生图" && state.h3ImageMatchReference) {
+            const size = await referenceOutputSize(task.referenceImages[0]);
+            return size || pageResolution(4, state.aspect);
+        }
+        return pageResolution(state.megapixels, state.aspect);
+    };
+    const refreshH3ImageSize = (match, ref) => {
+        const output = q("[data-output-size]");
+        const size = pageResolution(state.megapixels, state.aspect);
+        output.textContent = match ? "—" : `${size.width} × ${size.height}`;
+        if (!match || !ref) return;
+        referenceOutputSize(ref).then(dimensions => {
+            const task = activeImage();
+            if (dimensions && task.generationMode === "图生图" && state.h3ImageMatchReference
+                && fileUrl(task.referenceImages[0]) === fileUrl(ref)) {
+                output.textContent = `${dimensions.width} × ${dimensions.height}`;
+            }
+        });
+    };
+    const h3ModelLabels = {unet: "扩散模型", clip: "文本编码器", vae: "VAE", upsampler: "优化模型"};
+    const refreshH3ImageControls = () => {
+        if (!h3Controls) return;
+        const task = activeImage();
+        const isEdit = task.generationMode === "图生图";
+        const match = isEdit && state.h3ImageMatchReference;
+        h3Controls.matchRow.hidden = !isEdit;
+        h3Controls.match.checked = state.h3ImageMatchReference;
+        q("[data-aspect]").disabled = match;
+        if (match) q("[data-megapixels]").value = "4.0";
+        h3Controls.modelSettings.hidden = (officialH3ImageEdit && isEdit) || (h3ImageCanvas && hasWiredUpsampler());
+        const ref = isEdit && task.referenceImages[0];
+        refreshH3ImageSize(match, ref);
+        h3Controls.compare.hidden = !(ref && task.lastOutput);
+        if (h3Controls.compare.hidden) h3Controls.compare.open = false;
+        const imageUrls = [ref ? fileUrl(ref) : "", fileUrl(task.lastOutput)];
+        h3Controls.images.forEach((image, index) => {
+            if (imageUrls[index]) image.setAttribute("src", imageUrls[index]);
+            else image.removeAttribute("src");
+        });
+    };
+    const refreshH3ImageModels = async () => {
+        if (modelRefresh) return modelRefresh;
+        modelRefresh = (async () => {
+            const required = new Set(["UNETLoader", "CLIPLoader", "VAELoader", "MiniMaxH3ImageConditioning"]);
+            const definitions = Object.fromEntries(await Promise.all([...required].map(async name => {
+                const response = await api.fetchApi("/object_info/" + name);
+                return [name, response.ok ? (await response.json())?.[name] : null];
+            })));
+            if (!definitions.MiniMaxH3ImageConditioning) throw new Error("当前 ComfyUI 没有 MiniMax H3 Image Conditioning，请更新内核。");
+            const options = {};
+            for (const [key, [loader, , fallback]] of Object.entries(H3_IMAGE_MODELS)) {
+                const values = modelOptions(key, definitions[loader]);
+                options[key] = values;
+                const current = state.h3ImageModels[key];
+                const selected = values.includes(current) ? current :
+                    values.includes(fallback) ? fallback : values[0] || fallback;
+                state.h3ImageModels[key] = selected;
+                const select = h3Controls.models[key];
+                select.replaceChildren(...values.map(name => new Option(name, name)));
+                if (!values.length) select.append(new Option("未安装 · " + fallback, fallback));
+                select.value = selected;
+            }
+            const requiredModels = h3ImageCanvas ? ["upsampler"] : ["unet", "clip", "vae"];
+            const missing = requiredModels.filter(key => !options[key].length);
+            h3Controls.modelStatus.textContent = missing.length ? "缺少 " + missing.map(key => h3ModelLabels[key]).join("、") : "";
+            save();
+            return options;
+        })().finally(() => { modelRefresh = null; });
+        return modelRefresh;
+    };
+    const ensureH3ImageModels = async task => {
+        const options = await refreshH3ImageModels();
+        const keys = h3ImageCanvas ? ["upsampler"] :
+            task.generateText?.enabled ? Object.keys(H3_IMAGE_MODELS) : ["unet", "clip", "vae"];
+        const missing = keys.filter(key => !options[key].includes(state.h3ImageModels[key]));
+        if (missing.length) {
+            const files = missing.map(key => H3_IMAGE_MODELS[key][2]);
+            throw new Error("缺少 H3-IMAGE 模型：" + files.join("、"));
+        }
+    };
+    const mountH3ImageControls = () => {
+        root.classList.add("h3iaw-h3-image");
+        const settings = document.createElement("section");
+        settings.className = "h3iaw-h3-image-options";
+        settings.innerHTML = `
+            <label data-h3-match-row><input type="checkbox" data-h3-match> 跟随主参考图（4 MP）</label>
+            <details>
+                <summary>H3-IMAGE 模型文件</summary>
+                ${Object.entries(h3ModelLabels).map(([key, label]) =>
+                    `<label><span>${label}</span><select data-h3-model="${key}" aria-label="${label}"></select></label>`).join("")}
+                <button type="button" data-h3-refresh>刷新模型</button>
+                <small data-h3-model-status></small>
+            </details>`;
+        q("[data-resolution-settings]").after(settings);
+        const compare = document.createElement("details");
+        compare.className = "h3iaw-h3-image-compare";
+        compare.innerHTML = '<summary>主参考图与生成结果</summary><div><img alt="主参考图" loading="lazy"><img alt="生成结果" loading="lazy"></div>';
+        q("[data-storyboard-grid]").after(compare);
+        h3Controls = {
+            modelSettings: settings.querySelector("details"),
+            matchRow: settings.querySelector("[data-h3-match-row]"),
+            match: settings.querySelector("[data-h3-match]"),
+            models: Object.fromEntries([...settings.querySelectorAll("[data-h3-model]")].map(select => [select.dataset.h3Model, select])),
+            modelStatus: settings.querySelector("[data-h3-model-status]"),
+            compare,
+            images: [...compare.querySelectorAll("img")],
+        };
+        h3Controls.match.onchange = () => { state.h3ImageMatchReference = h3Controls.match.checked; syncFields(); save(); };
+        for (const [key, select] of Object.entries(h3Controls.models)) {
+            select.append(new Option(state.h3ImageModels[key], state.h3ImageModels[key]));
+            select.onchange = () => { state.h3ImageModels[key] = select.value; save(); };
+            if (h3ImageCanvas && key !== "upsampler") select.parentElement.remove();
+        }
+        if (h3ImageCanvas) settings.querySelector("summary").textContent = "提示词优化模型";
+        const refresh = () => refreshH3ImageModels().catch(error => { h3Controls.modelStatus.textContent = error.message; });
+        settings.querySelector("[data-h3-refresh]").onclick = refresh;
+        refresh();
+    };
+    const stopQueuedPrompt = async (promptId) => {
+        const post = async (route, data) => {
+            const response = await api.fetchApi(route, {
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data),
+            });
+            if (!response.ok) throw new Error(`${route} HTTP ${response.status}`);
+        };
+        try {
+            await post("/queue", { delete: [promptId] });
+        } finally {
+            await post("/interrupt", { prompt_id: promptId });
+        }
+    };
     const generateJobs = async (jobs, triggerButton) => {
         if (running) return;
+        if (!h3Image && (h3ImageCanvas || officialH3ImageEdit)) {
+            await workbenchAlert("当前画布连接的是 H3-IMAGE 生成链。请打开 P-H3 工作流生成 P-H3 分镜。", "请打开 P-H3 工作流");
+            return;
+        }
         if (!jobs.length) { q("[data-image-status]").textContent = "当前没有可生成的分镜"; return; }
         const missingPrompt = jobs.find(({ imageTask }) => !String(imageTask.prompt || "").trim());
         if (missingPrompt) {
@@ -2000,12 +2393,16 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
         jobs = jobs.flatMap((job) => Array.from({ length: Math.max(1, Math.min(10, Number(job.imageTask.drawCount) || 1)) }, () => job));
         generationBatch = { index: 0, total: jobs.length, promptId: "" };
         generationInterrupted = false;
-        setHeaderProgress("准备生成", 0, `图片 0/${jobs.length}`);
+        stopRequest = null;
+        q("[data-status]").textContent = "";
+        q("[data-status]").classList.remove("error");
+        startImageDuration();
+        setHeaderProgress("准备生成");
         running = true;
+        q("[data-model-profile]").disabled = true;
         const button = triggerButton || q("[data-generate]");
         const mainGenerateButton = q("[data-generate]");
         const currentGenerateButton = q("[data-generate-current]");
-        const status = q("[data-status]");
         const localStatus = q("[data-image-status]");
         const originalShot = state.activeShotId;
         const originalImage = activeShot().activeImageId;
@@ -2016,34 +2413,70 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
         try {
             let completedShots = 0;
             const completedPromptIds = [];
+            let lastFile = "";
             for (let index = 0; index < jobs.length; index += 1) {
+                if (generationInterrupted) throw new Error("生成已停止");
                 const { shot, imageTask } = jobs[index];
-                generationBatch = { index, total: jobs.length, promptId: "" };
-                startImageDuration();
-                setHeaderProgress("准备当前图片", index / jobs.length * 100, `图片 ${index + 1}/${jobs.length}`);
+                if (h3Image && imageTask.characterMultiview?.appliedBlock) {
+                    const { prompt, settings } = formatH3MultiviewCanvas({
+                        generationMode: imageTask.generationMode, prompt: imageTask.prompt, settings: imageTask.characterMultiview,
+                    }, imageTask.referenceImages, state.modelProfile);
+                    imageTask.prompt = prompt;
+                    imageTask.characterMultiview = settings;
+                }
+                generationBatch = { index, total: jobs.length, promptId: "", shotName: shot.title };
+                setHeaderProgress("准备当前图片");
                 state.activeShotId = shot.id;
                 shot.activeImageId = imageTask.id;
                 promptTab = "positive";
                 renderPromptTabs();
                 syncFields(); render(); showResult(imageTask); save();
                 const progressText = `图片 ${index + 1}/${jobs.length}：生成中`;
-                status.textContent = progressText;
                 localStatus.textContent = progressText;
-                await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                applyModelGroupSwitch(node, state.modelProfile);
-                const workflow = await app.graphToPrompt();
-                const ownInputs = workflow.output?.[String(node.id)]?.inputs;
-                if (!ownInputs) throw new Error("当前工作流未找到闲兔H3生图工作台");
-                h3JobInputs(ownInputs, imageTask, state);
-                if (!randomizeWorkflowSeeds(workflow)) console.warn("[图片素材工作台] 当前工作流未找到可随机化的采样种子输入");
+                let workflow;
+                if (h3Image && officialH3ImageEdit && imageTask.generationMode === "图生图") {
+                    workflow = await serializeWithLoraModes(node, state, imageTask, () => app.graphToPrompt());
+                    configureOfficialH3ImageEdit(workflow.output, imageTask, state);
+                    randomizeWorkflowSeeds(workflow);
+                } else if (h3Image && !h3ImageCanvas) {
+                    await ensureH3ImageModels(imageTask);
+                    const seed = crypto.getRandomValues(new Uint32Array(1))[0];
+                    const prompts = imageTask.generateText?.enabled ? await loadH3ImageOfficialPrompts() : null;
+                    workflow = buildH3ImagePrompt(state, imageTask, seed, prompts);
+                } else {
+                    applyModelGroupSwitch(node, state.modelProfile);
+                    if (h3Image && imageTask.generateText?.enabled && !hasWiredUpsampler()) await ensureH3ImageModels(imageTask);
+                    workflow = await serializeWithLoraModes(node, state, imageTask, () => app.graphToPrompt());
+                    const ownInputs = workflow.output?.[String(node.id)]?.inputs;
+                    if (!ownInputs) throw new Error("当前工作流未找到闲兔H3生图工作台");
+                    if (h3Image) ownInputs.h3_image_state = JSON.stringify(state);
+                    else {
+                        h3JobInputs(ownInputs, imageTask, state);
+                        if (!randomizeWorkflowSeeds(workflow)) console.warn("[图片素材工作台] 当前工作流未找到可随机化的采样种子输入");
+                    }
+                    setCanvasImageFilename(workflow.output, node.id, state);
+                }
+                if (generationInterrupted) throw new Error("生成已停止");
+                if (generationInterrupted) throw new Error("生成已停止");
+                const early = [];
+                Object.assign(generationBatch, { nodes: workflow.output || workflow, aliases: new Map(), early });
+                setHeaderProgress("提交工作流");
                 const queued = await api.queuePrompt(0, workflow);
                 if (!queued?.prompt_id) throw new Error("ComfyUI 没有返回任务编号");
                 generationBatch.promptId = String(queued.prompt_id);
-                setHeaderProgress("采样生成中", index / jobs.length * 100, `图片 ${index + 1}/${jobs.length}`);
+                generationBatch.early = null;
+                if (generationInterrupted && !stopRequest) {
+                    stopRequest = stopQueuedPrompt(generationBatch.promptId);
+                    throw new Error("生成已停止");
+                }
+                setHeaderProgress("排队中");
+                for (const [name, raw] of early) handleRunEvent(name, raw);
                 completedPromptIds.push(String(queued.prompt_id));
                 imageTask.lastPromptId = String(queued.prompt_id);
                 save();
                 const history = await waitForPrompt(queued.prompt_id);
+                if (generationInterrupted) throw new Error("生成已停止");
+                if (h3Image) imageTask.h3GeneratedText = String(optimizedHistoryText(history) || "");
                 const images = outputImages(history);
                 if (!images.length) throw new Error(`图片 ${index + 1} 完成，但工作流没有输出图片文件`);
                 imageTask.outputs = Array.isArray(imageTask.outputs) ? imageTask.outputs : [];
@@ -2057,15 +2490,16 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
                     savedOutput = imageTask.outputs.at(-1);
                 }
                 imageTask.lastOutput = savedOutput;
-                stopImageDuration();
-                setHeaderProgress("图片生成完成", (index + 1) / jobs.length * 100, `图片 ${index + 1}/${jobs.length}`);
+                lastFile = [savedOutput.subfolder, savedOutput.name].filter(Boolean).join("/");
+                generationBatch.promptId = "";
+                setHeaderProgress("图片生成完成", { completed: index + 1, percent: 100, detail: lastFile });
                 showResult(imageTask);
                 render(); save();
                 const shotCompleted = index === jobs.length - 1 || jobs[index + 1].shot.id !== shot.id;
                 if (shotCompleted) {
                     completedShots += 1;
                     if (index < jobs.length - 1 && completedShots % state.cleanupSettings.every === 0) {
-                        setHeaderProgress("卸载资源", (index + 1) / jobs.length * 100, `已完成 ${completedShots} 个分镜`);
+                        setHeaderProgress("卸载资源", { completed: index + 1 });
                         await cleanupResources();
                     }
                 }
@@ -2074,35 +2508,37 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
             state.activeShotId = originalShot;
             const restoredShot = activeShot();
             if (restoredShot.images.some((image) => image.id === originalImage)) restoredShot.activeImageId = originalImage;
-            syncFields(); render(); showResult(); save();
-            status.textContent = `${jobs.length} 张图片已完成`;
+            syncFields(); render(); showResult();
             localStatus.textContent = `${jobs.length} 张图片已完成`;
-            setHeaderProgress("全部完成", 100, `图片 ${jobs.length}/${jobs.length}`);
+            stopImageDuration();
+            setHeaderProgress("全部完成", { completed: jobs.length, percent: 100, detail: lastFile, shotName: "" });
+            save();
             mainGenerateButton.textContent = "✓ 全部完成";
             if (button === currentGenerateButton) currentGenerateButton.textContent = "✓ 生成完成";
         } catch (error) {
             stopImageDuration();
             if (generationInterrupted) {
-                status.textContent = "生成已停止";
-                status.classList.remove("error");
-                localStatus.textContent = "生成已停止";
-                setHeaderProgress("已停止", 0, "");
+                const stopError = await stopRequest?.catch(reason => reason);
+                localStatus.textContent = stopError ? "停止请求失败" : "生成已停止";
+                setHeaderProgress(stopError ? "停止请求失败" : "已停止", { percent: 0, detail: String(stopError?.message || "") });
                 mainGenerateButton.textContent = "▶ 重新生成";
                 currentGenerateButton.textContent = "生成当前分镜";
                 save();
             } else {
-                status.textContent = String(error?.message || error);
-                status.classList.add("error");
-                localStatus.textContent = String(error?.message || error);
-                setHeaderProgress("生成失败", generationBatch.total ? generationBatch.index / generationBatch.total * 100 : 0, generationBatch.total ? `图片 ${generationBatch.index + 1}/${generationBatch.total}` : "");
+                const message = String(error?.message || error);
+                localStatus.textContent = message;
+                setHeaderProgress("生成失败", { percent: 0, detail: message });
+                save();
                 mainGenerateButton.textContent = "▶ 重新生成";
                 currentGenerateButton.textContent = "生成当前分镜";
             }
         } finally {
             running = false;
+            q("[data-model-profile]").disabled = false;
             generationBatch = { ...generationBatch, total: 0, promptId: "" };
             mainGenerateButton.disabled = false;
             currentGenerateButton.disabled = false;
+            if (!root.isConnected) disposeWorkbench();
             setTimeout(() => {
                 if (!root.isConnected || running) return;
                 mainGenerateButton.textContent = "▶ 开始生成";
@@ -2110,17 +2546,19 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
             }, 2000);
         }
     };
-    const stopGeneration = async () => {
+    const stopGeneration = () => {
         if (!running || generationInterrupted) return;
         generationInterrupted = true;
+        setHeaderProgress("停止中");
         q("[data-generate]").disabled = true;
         q("[data-generate]").textContent = "正在停止…";
         q("[data-generate-current]").disabled = true;
-        try {
-            await api.fetchApi("/interrupt", { method: "POST" });
-        } catch (error) {
-            console.warn("图片工作台停止生成请求失败", error);
+        if (generationBatch.promptId) {
+            stopRequest = stopQueuedPrompt(generationBatch.promptId);
+            // The run reports errors when it reaches its stop handler.
+            stopRequest.catch(() => {});
         }
+        wakeHistoryCheck();
     };
     q("[data-generate]").onclick = () => {
         if (running) return stopGeneration();
@@ -2128,40 +2566,52 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
         return generateJobs(state.shots.slice(startIndex).map((shot) => ({ shot, imageTask: activeImage(shot) })), q("[data-generate]"));
     };
     q("[data-generate-current]").onclick = () => generateJobs([{ shot: activeShot(), imageTask: activeImage() }], q("[data-generate-current]"));
-    q("[data-close]").onclick = () => { api.removeEventListener?.("progress", onSamplingProgress); api.removeEventListener?.("execution_success", onExecutionSuccess); api.removeEventListener?.("executed", onExecutionSuccess); api.removeEventListener?.("execution_interrupted", onExecutionInterrupted); clearInterval(hardwareTimer); clearTimeout(imageGenerationTimer); save(); root.remove(); node._h3iaw = null; };
-    api.addEventListener?.("progress", onSamplingProgress);
+    const disposeWorkbench = () => {
+        for (const [name, listener] of runEventListeners) api.removeEventListener?.(name, listener);
+        api.removeEventListener?.("execution_success", onExecutionSuccess);
+        api.removeEventListener?.("executed", onExecutionSuccess);
+        if (node._h3iaw?.root === root) node._h3iaw = null;
+    };
+    q("[data-close]").onclick = () => {
+        clearInterval(hardwareTimer);
+        clearTimeout(imageGenerationTimer);
+        save();
+        root.remove();
+        if (!running) disposeWorkbench();
+    };
+    for (const [name, listener] of runEventListeners) api.addEventListener?.(name, listener);
     api.addEventListener?.("execution_success", onExecutionSuccess);
     api.addEventListener?.("executed", onExecutionSuccess);
-    api.addEventListener?.("execution_interrupted", onExecutionInterrupted);
     imageGenerationStartedAt = Math.max(0, Number(state.generationProgress.imageStartedAt) || 0);
     imageGenerationElapsedMs = Math.max(0, Number(state.generationProgress.imageElapsedMs) || 0);
-    setHeaderProgress(state.generationProgress.title, state.generationProgress.percent, state.generationProgress.batchText);
-    if (imageGenerationStartedAt) runImageDurationClock();
-    syncHardwareMonitor();
+    renderHeaderProgress();
     applyNodeProtocol(node, state);
     queueMicrotask(() => {
-        applyModelGroupSwitch(node, state.modelProfile);
-        if (/准备|采样|生成中|卸载资源/.test(state.generationProgress.title)) {
+        if (!h3Image) applyModelGroupSwitch(node, state.modelProfile);
+        if (imageGenerationStartedAt) {
             api.fetchApi(`/queue?t=${Date.now()}`).then((response) => response.ok ? response.json() : null).then((queue) => {
                 const busy = (Array.isArray(queue?.queue_running) && queue.queue_running.length) || (Array.isArray(queue?.queue_pending) && queue.queue_pending.length);
                 if (!busy && root.isConnected && !running) {
                     generationInterrupted = true;
                     stopImageDuration();
-                    setHeaderProgress("已停止", 0, "");
-                    q("[data-status]").textContent = "生成已停止";
+                    setHeaderProgress("已停止", { percent: 0 });
                     q("[data-image-status]").textContent = "生成已停止";
                     save();
                 }
             }).catch(() => {});
         }
     });
-    syncH3PromptControls = mountH3PromptControls(root, node, state, activeImage, save, (tab) => { promptTab = tab; renderPromptTabs(); });
-    mountCharacterMultiviewButton(root, state, activeImage, save, () => { syncFields(); render(); }, workbenchAlert);
+    syncH3PromptControls = mountH3PromptControls(root, node, state, activeImage, save, (tab) => { promptTab = tab; renderPromptTabs(); }, !h3Image);
+    if (h3Image) mountH3ImageControls();
+    mountCharacterMultiviewButton(root, state, activeImage, save, () => { syncFields(); render(); }, workbenchAlert, {
+        referenceLimit, resolutionFor: pageResolution, canvasSize: multiviewCanvasSize,
+    });
+    mountLoraControls(root, node, state, { getShot: activeShot, getTask: activeImage, usesCanvas: usesCanvasLoras, save });
     const promptLabel = root.querySelector('[data-prompt-tab="positive"]');
     if (promptLabel) promptLabel.textContent = "提示词";
     syncFields(); render(); showResult(); save();
     recoverLatestHistory().catch((error) => console.warn("打开工作台时恢复最近图片失败", error));
-    return root;
+    return { root, resume: () => { runImageDurationClock(); syncHardwareMonitor(); } };
 }
 
 app.registerExtension({
@@ -2198,7 +2648,7 @@ app.registerExtension({
         node.mode = globalThis.LiteGraph?.ALWAYS ?? 0;
         node.title = NODE_TITLE;
         for (const widget of node.widgets || []) {
-            if (!["project_name", "workbench_state"].includes(widget.name)) continue;
+            if (!["project_name", "workbench_state", "h3_image_state"].includes(widget.name)) continue;
             widget.type = "converted-widget";
             widget.hidden = true;
             widget.computeSize = () => [0, -4];
@@ -2208,15 +2658,19 @@ app.registerExtension({
             widget.serializeValue = async () => widget.value;
             if (widget.element) widget.element.style.display = "none";
         }
-        const open = () => {
-            if (node._h3iaw?.isConnected) return;
+        const openPage = (profile) => {
+            if (node._h3iaw?.root.isConnected) return;
             try {
-                node._h3iaw = createWorkbench(node);
-                document.body.appendChild(node._h3iaw);
+                node.properties ||= {};
+                node.properties.h3ImageWorkbenchPage = profile;
+                node._h3iaw ||= createWorkbench(node, profile, openPage);
+                document.body.appendChild(node._h3iaw.root);
+                node._h3iaw.resume();
             } catch (error) {
                 console.error("打开 MOSS 图片资产工作台失败", error);
             }
         };
+        const open = () => openPage(node.properties?.h3ImageWorkbenchPage === "H3-IMAGE" ? "H3-IMAGE" : "MOSS");
         node.__h3iawOpen = open;
         const openWidget = node.addWidget("button", "打开H3生图工作台", "打开H3生图工作台", open, { serialize: false });
         openWidget.callback = open;

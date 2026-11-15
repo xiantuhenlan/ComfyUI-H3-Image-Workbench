@@ -14,7 +14,7 @@ export function h3JobInputs(inputs, image, state) {
         delete inputs[key];
 }
 
-export function mountH3PromptControls(root, node, state, getImage, save, selectTab) {
+export function mountH3PromptControls(root, node, state, getImage, save, selectTab, receiveNodeEvents = true) {
     const panel = document.createElement("section");
     panel.className = "h3iaw-optimized-prompt";
     panel.dataset.promptPane = "optimized";
@@ -51,26 +51,27 @@ export function mountH3PromptControls(root, node, state, getImage, save, selectT
         checkbox.checked = Boolean(textSettings(image).enabled);
         panel.querySelector("[data-h3-optimized]").value = image.h3GeneratedText || "";
     }
-    node.__h3PromptReceive = message => {
-        if (!root.isConnected) return;
-        const shot = state.shots.find(item => item.id === message.h3_shot_id?.[0]);
-        const image = shot?.images?.find(item => item.id === message.h3_task_id?.[0]);
-        if (!image) return;
-        const generated = message.h3_generated_text?.[0];
-        if (generated != null) image.h3GeneratedText = generated;
-        save(); refresh();
-        if (getImage() === image && generated != null && textSettings(image).enabled) selectTab("optimized");
-    };
-    if (!node.__h3PromptHandlerInstalled) {
-        const prior = node.onExecuted;
-        node.onExecuted = function(message) {
-            const result = prior?.call(this, message);
-            this.__h3PromptReceive?.(message);
-            return result;
+    if (receiveNodeEvents) {
+        node.__h3PromptReceive = message => {
+            if (!root.isConnected) return;
+            const shot = state.shots.find(item => item.id === message.h3_shot_id?.[0]);
+            const image = shot?.images?.find(item => item.id === message.h3_task_id?.[0]);
+            if (!image) return;
+            const generated = message.h3_generated_text?.[0];
+            if (generated != null) image.h3GeneratedText = generated;
+            save(); refresh();
+            if (getImage() === image && generated != null && textSettings(image).enabled) selectTab("optimized");
         };
-        node.__h3PromptHandlerInstalled = true;
+        if (!node.__h3PromptHandlerInstalled) {
+            const prior = node.onExecuted;
+            node.onExecuted = function(message) {
+                const result = prior?.call(this, message);
+                this.__h3PromptReceive?.(message);
+                return result;
+            };
+            node.__h3PromptHandlerInstalled = true;
+        }
     }
-    root.querySelector("[data-model-profile]").replaceChildren(new Option("H3 模型", "MOSS"));
     refresh();
     selectTab("positive");
     return refresh;

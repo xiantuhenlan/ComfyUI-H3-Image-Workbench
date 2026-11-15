@@ -22,15 +22,16 @@ export function repairWorkbenchNode(node, saved = null) {
         if (!Object.hasOwn(modelInputs,node.inputs[i].name)) node.removeInput(i);
     for (const [name,type] of Object.entries(modelInputs))
         if (!node.inputs?.some(input=>input.name===name)) node.addInput(name,type);
-    for (let i=(node.outputs?.length || 0)-1;i>=2;i--) node.removeOutput(i);
-    for (const [index,name,type] of [[0,"positive","CONDITIONING"],[1,"Latent","LATENT"]]) {
+    for (let i=(node.outputs?.length || 0)-1;i>=3;i--) node.removeOutput(i);
+    for (const [index,name,type] of [[0,"positive","CONDITIONING"],[1,"Latent","LATENT"],[2,"文件名","STRING"]]) {
         if (!node.outputs?.[index]) node.addOutput(name,type);
         const output=node.outputs[index];
         if (output.type !== type) node.disconnectOutput?.(index);
         output.type=type;output.name=name;output.label=name;
     }
-    node.widgets = (node.widgets || []).filter(w => ["project_name","workbench_state","打开H3生图工作台"].includes(w.name));
-    for (const [name,value] of [["project_name",project],["workbench_state",stateValue]]) {
+    node.widgets = (node.widgets || []).filter(w => ["project_name","workbench_state","h3_image_state","打开H3生图工作台"].includes(w.name));
+    const h3ImageState = node.properties?.h3ImageCanvas ? node.properties?.h3ImagePageState || "" : "";
+    for (const [name,value] of [["project_name",project],["workbench_state",stateValue],["h3_image_state",h3ImageState]]) {
         let widget=node.widgets.find(w=>w.name===name);
         if (!widget) widget=node.addWidget("text",name,value,()=>{},{});
         widget.value=value;widget.type="converted-widget";widget.hidden=true;
