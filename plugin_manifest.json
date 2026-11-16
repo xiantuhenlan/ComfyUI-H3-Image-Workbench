@@ -2,7 +2,8 @@
   "schemaVersion": 1,
   "pluginId": "comfyui-h3-image-workbench",
   "displayName": "ComfyUI-H3-Image-Workbench（闲兔H3生图工作台）",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "channel": "stable",
-  "repository": "https://github.com/xiantuhenlan/ComfyUI-H3-Image-Workbench"
+  "repository": "https://github.com/xiantuhenlan/ComfyUI-H3-Image-Workbench",
+  "updateManifestUrl": "https://raw.githubusercontent.com/xiantuhenlan/ComfyUI-H3-Image-Workbench/main/plugin_manifest.json"
 }
