@@ -20,3 +20,9 @@
 - Optional core prompt optimization, default off; existing explicit choices retained. Double-click selects all prompt text.
 - Independent asset library and hardware monitoring. Optional integration with Character Multiview Workbench.
 - Experimental multiview white-model editing, with unresolved real-generation adherence limitations for headless/side/appearance transfer; no guarantee of correct generated layouts.
+## [0.1.3] - 2026-11-20
+
+- 修复 H3-IMAGE 使用画布工作流时，多次抽卡沿用同一个种子的问题。
+- 每次提交生成任务更新采样种子，保持画布、模型、分辨率及其他采样参数不变。
+
+安装/更新后保存当前工作流，重启 ComfyUI 并 Ctrl+F5 刷新前端。模型文件不包含在插件内。

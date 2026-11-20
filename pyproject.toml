@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-h3-image-workbench"
-version = "0.1.2"
+version = "0.1.3"
 description = "Independent P-H3 and MiniMax H3-IMAGE workbench with per-shot prompts, reference images, optional prompt optimization, an asset library, and hardware monitoring."
 readme = "README.md"
 license = { file = "LICENSE" }

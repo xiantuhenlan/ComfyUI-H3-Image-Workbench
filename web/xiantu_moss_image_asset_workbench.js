@@ -2450,10 +2450,8 @@ Qwen Image 2.1 使用清晰、具体的自然语言指令，不需要 MOSS Layou
                     const ownInputs = workflow.output?.[String(node.id)]?.inputs;
                     if (!ownInputs) throw new Error("当前工作流未找到闲兔H3生图工作台");
                     if (h3Image) ownInputs.h3_image_state = JSON.stringify(state);
-                    else {
-                        h3JobInputs(ownInputs, imageTask, state);
-                        if (!randomizeWorkflowSeeds(workflow)) console.warn("[图片素材工作台] 当前工作流未找到可随机化的采样种子输入");
-                    }
+                    else h3JobInputs(ownInputs, imageTask, state);
+                    if (!randomizeWorkflowSeeds(workflow)) console.warn("[图片素材工作台] 当前工作流未找到可随机化的采样种子输入");
                     setCanvasImageFilename(workflow.output, node.id, state);
                 }
                 if (generationInterrupted) throw new Error("生成已停止");
