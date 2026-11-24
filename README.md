@@ -92,3 +92,5 @@ Do not commit tokens, user assets, workflows, generated outputs or model files.
 H3-IMAGE 内置官方文生图和图生图流程。支持 4 至 20 MP 输出预设，图生图支持按主参考图比例调整到约 4 MP 并按 32 像素对齐。最多 16 张参考图，可在提示词中用 `@` 选择，按顺序插入 `<Picture 1>`、`<Picture 2>` 等引用。支持可选的官方提示词扩写、分镜生成和主参考图与结果对比。默认保存目录为 `output/H3生图`。
 
 在 H3-IMAGE 页展开「H3-IMAGE 模型文件」可刷新和选择本地文件。需要 MiniMax-H3-Image 扩散模型和 VAE、MiniMax H3 文本编码器；启用提示词优化时还需要 Qwen3.5 或 Qwen3.8 扩写模型。需要提供 MiniMaxH3ImageConditioning 的 ComfyUI，已针对 0.45.2 做流程验证。模型请参照 [官方图生图工作流](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_minimax_h3_image_edit.json) 和 [官方文生图工作流](https://github.com/Comfy-Org/workflow_templates/blob/main/templates/image_minimax_h3_image_t2i.json)。
+
+当前发布版本：`0.1.4`。完整仓库与更新清单地址见 `plugin_manifest.json`。
